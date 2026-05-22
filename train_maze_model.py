@@ -255,27 +255,26 @@ def find_solution_path(maze: np.ndarray) -> Tuple[bool, List[Tuple[int, int]], T
     height, width = maze.shape
     
     # Находим все возможные входы/выходы на краях
-    entries = []
-    exits = []
+    edge_points = []
     
     for x in range(width):
         if maze[0, x] == 0:
-            entries.append((0, x))
+            edge_points.append((0, x))
         if maze[height-1, x] == 0:
-            exits.append((height-1, x))
+            edge_points.append((height-1, x))
     
     for y in range(height):
         if maze[y, 0] == 0:
-            entries.append((y, 0))
+            edge_points.append((y, 0))
         if maze[y, width-1] == 0:
-            exits.append((y, width-1))
+            edge_points.append((y, width-1))
     
-    if not entries or not exits:
+    if len(edge_points) < 2:
         return False, [], None, None
     
-    # Ищем путь между всеми парами
-    for entry in entries:
-        for exit_point in exits:
+    # Ищем путь между всеми парами точек на краю
+    for i, entry in enumerate(edge_points):
+        for exit_point in edge_points[i+1:]:
             # BFS
             visited = {entry: None}
             queue = deque([entry])
@@ -327,7 +326,8 @@ def generate_maze_with_solution(
     else:
         maze = generate_maze_prim(width, height)
     
-    # Добавляем входы/выходы
+    # Добавляем входы/выходы на краях лабиринта
+    # Для этого находим клетки рядом с краем и открываем сам край
     edges = {
         'top': [(0, x) for x in range(1, width, 2) if maze[1, x] == 0],
         'bottom': [(height - 1, x) for x in range(1, width, 2) if maze[height - 2, x] == 0],
@@ -344,6 +344,18 @@ def generate_maze_with_solution(
         exit_candidate = random.choice(edges[exit_edge])
         maze[entry_candidate] = 0
         maze[exit_candidate] = 0
+    elif len(edge_keys) == 1:
+        # Если только одна сторона доступна, создаем второй вход на той же стороне
+        edge = edge_keys[0]
+        if len(edges[edge]) >= 2:
+            entry_candidate = random.choice(edges[edge])
+            exit_candidate = random.choice([p for p in edges[edge] if p != entry_candidate])
+            maze[entry_candidate] = 0
+            maze[exit_candidate] = 0
+        else:
+            return None  # Недостаточно точек для входа/выхода
+    else:
+        return None  # Нет доступных краев
     
     # Находим решение
     is_solvable, path, entry, exit_point = find_solution_path(maze)
