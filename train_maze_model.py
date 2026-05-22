@@ -400,6 +400,7 @@ class MazeDatasetOnTheFly(Dataset):
         self.algorithms = algorithms if algorithms else list(MazeAlgorithm)
         self.augment = augment
         self.worker_rng = random.Random()
+        self.base_seed = seed if seed is not None else 42
         
         if seed is not None:
             self.worker_rng.seed(seed)
@@ -407,9 +408,10 @@ class MazeDatasetOnTheFly(Dataset):
     def __len__(self) -> int:
         return self.num_samples
     
-    def __worker_init_fn(self, worker_id: int):
+    def _worker_init_fn(self, worker_id: int):
+        """Инициализация RNG для каждого worker."""
         base_seed = torch.initial_seed() % (2**32)
-        self.worker_rng.seed(base_seed + worker_id)
+        self.worker_rng.seed(base_seed + worker_id + self.base_seed)
     
     def _augment(self, maze: np.ndarray, solution: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         """Аугментация данных: вращения и отражения."""
@@ -478,15 +480,20 @@ def collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
     Custom collate function для обработки разных размеров лабиринтов.
     Padding до максимального размера в батче.
     """
-    # Проверяем форму тензоров - они могут быть (1, H, W) или (C, H, W)
-    if len(batch[0]['image'].shape) == 3:
-        # Форма (C, H, W) - нет batch dimension
-        max_h = max(item['image'].shape[1] for item in batch)
-        max_w = max(item['image'].shape[2] for item in batch)
-    else:
-        # Форма (B, C, H, W)
-        max_h = max(item['image'].shape[2] for item in batch)
-        max_w = max(item['image'].shape[3] for item in batch)
+    # Получаем размеры всех изображений в батче
+    batch_size = len(batch)
+    
+    # Находим максимальные H и W
+    max_h = 0
+    max_w = 0
+    for item in batch:
+        img = item['image']
+        if len(img.shape) == 3:
+            h, w = img.shape[1], img.shape[2]
+        else:
+            h, w = img.shape[2], img.shape[3]
+        max_h = max(max_h, h)
+        max_w = max(max_w, w)
     
     # Делаем размеры нечетными (требуется для U-Net с pooling)
     if max_h % 2 == 0:
@@ -494,8 +501,7 @@ def collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
     if max_w % 2 == 0:
         max_w += 1
     
-    batch_size = len(batch)
-    
+    # Создаем тензоры с padding
     images = torch.zeros(batch_size, 1, max_h, max_w, dtype=torch.float32)
     targets = torch.zeros(batch_size, 1, max_h, max_w, dtype=torch.float32)
     
@@ -503,14 +509,19 @@ def collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
         img = item['image']
         tgt = item['target']
         
-        # Получаем H и W в зависимости от формы
+        # Сжимаем до (H, W) если есть канал
         if len(img.shape) == 3:
-            h, w = img.shape[1], img.shape[2]
+            img_2d = img.squeeze(0)
+            tgt_2d = tgt.squeeze(0)
         else:
-            h, w = img.shape[2], img.shape[3]
+            img_2d = img
+            tgt_2d = tgt
         
-        images[i, :, :h, :w] = img.squeeze(0) if len(img.shape) == 3 else img
-        targets[i, :, :h, :w] = tgt.squeeze(0) if len(tgt.shape) == 3 else tgt
+        h, w = img_2d.shape[0], img_2d.shape[1]
+        
+        # Копируем в верхний левый угол
+        images[i, 0, :h, :w] = img_2d
+        targets[i, 0, :h, :w] = tgt_2d
     
     return {
         'image': images,
@@ -639,23 +650,50 @@ class EarlyStopping:
 
 
 def calculate_pos_weight(loader: DataLoader, device: torch.device, num_batches: int = 100) -> torch.Tensor:
-    """Динамический расчет pos_weight на основе выборки данных."""
+    """Динамический расчет pos_weight на основе выборки данных.
+    Использует отдельный dataset для избежания проблем с collate_fn."""
     total_pos = 0
     total_neg = 0
     
-    for i, batch in enumerate(loader):
-        if i >= num_batches:
-            break
-        
-        target = batch['target']
-        total_pos += (target == 1).sum().item()
-        total_neg += (target == 0).sum().item()
+    # Создаем новый dataset с фиксированным размером для стабильности
+    from train_maze_model import MazeDatasetOnTheFly
+    temp_dataset = MazeDatasetOnTheFly(
+        num_samples=num_batches * loader.batch_size,
+        size_range=(33, 33),  # Фиксированный размер чтобы избежать проблем с padding
+        augment=False,
+        seed=123
+    )
+    
+    temp_loader = DataLoader(
+        temp_dataset,
+        batch_size=loader.batch_size,
+        shuffle=False,
+        num_workers=0,
+        pin_memory=False
+    )
+    
+    try:
+        for i, batch in enumerate(temp_loader):
+            if i >= num_batches:
+                break
+            
+            target = batch['target']
+            total_pos += (target == 1).sum().item()
+            total_neg += (target == 0).sum().item()
+    except Exception as e:
+        logger.warning(f"Ошибка при расчете pos_weight: {e}")
+        logger.warning("Используем значение по умолчанию 10.0")
+        return torch.tensor([10.0], dtype=torch.float32, device=device)
     
     if total_pos == 0:
+        logger.warning("Не найдено положительных пикселей! Используем вес 1.0")
         return torch.tensor([1.0], dtype=torch.float32, device=device)
     
     pos_weight = torch.tensor([total_neg / total_pos], dtype=torch.float32, device=device)
-    return torch.clamp(pos_weight, min=1.0, max=1000.0)
+    pos_weight = torch.clamp(pos_weight, min=1.0, max=100.0)
+    logger.info(f"Найдено {total_pos/(total_pos+total_neg)*100:.2f}% положительных пикселей")
+    logger.info(f"Расчетный pos_weight: {pos_weight.item():.2f}")
+    return pos_weight
 
 
 def train(config: TrainingConfig = None, continue_from_checkpoint: bool = False):
@@ -689,26 +727,32 @@ def train(config: TrainingConfig = None, continue_from_checkpoint: bool = False)
     )
     
     # DataLoaders
+    logger.info("Создание DataLoader...")
+    
+    # Для стабильности используем num_workers=0 если возникают проблемы
+    # Или уменьшаем до 2 если много памяти
+    safe_num_workers = min(config.num_workers, 2) if torch.cuda.is_available() else 0
+    
     train_loader = DataLoader(
         train_dataset,
         batch_size=config.batch_size,
         shuffle=True,
-        num_workers=config.num_workers,
-        pin_memory=config.pin_memory,
+        num_workers=safe_num_workers,  # Безопасное значение
+        pin_memory=config.pin_memory if safe_num_workers > 0 else False,
         collate_fn=collate_fn,
-        persistent_workers=True if config.num_workers > 0 else False,
-        worker_init_fn=train_dataset._MazeDataset__worker_init_fn
+        persistent_workers=False,  # Отключаем для стабильности
+        worker_init_fn=train_dataset._worker_init_fn if hasattr(train_dataset, '_worker_init_fn') else None
     )
     
     val_loader = DataLoader(
         val_dataset,
         batch_size=config.batch_size,
         shuffle=False,
-        num_workers=config.num_workers,
-        pin_memory=config.pin_memory,
+        num_workers=safe_num_workers,  # Безопасное значение
+        pin_memory=config.pin_memory if safe_num_workers > 0 else False,
         collate_fn=collate_fn,
-        persistent_workers=True if config.num_workers > 0 else False,
-        worker_init_fn=val_dataset._MazeDataset__worker_init_fn
+        persistent_workers=False,  # Отключаем для стабильности
+        worker_init_fn=val_dataset._worker_init_fn if hasattr(val_dataset, '_worker_init_fn') else None
     )
     
     # Модель
